@@ -1,157 +1,241 @@
 import streamlit as st
+import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timezone
 
-# Configuração inicial da página
-st.set_page_config(page_title="Dashboard DeFi - DeFiLlama", layout="wide")
+st.set_page_config(page_title="DeFi Dashboard", layout="wide")
 
-st.title("📊 Dashboard DeFi - Dados do DeFiLlama")
+# ---------- helpers ----------
 
-
-@st.cache_data(ttl=3600)
-def get_protocols():
-    url = "https://api.llama.fi/protocols"
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-@st.cache_data(ttl=3600)
-def get_global_tvl_chart():
-    url = "https://api.llama.fi/v2/historicalChainTvl"
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-@st.cache_data(ttl=3600)
-def get_chain_tvl_chart(chain_slug):
-    url = f"https://api.llama.fi/v2/historicalChainTvl/{chain_slug}"
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def process_global_tvl_chart(data):
-    """Processa dados do histórico global de TVL com tratamento de erro robusto."""
-    records = []
-    for item in data:
-        try:
-            raw_timestamp = item.get("date")
-            if raw_timestamp is None:
-                continue
-            # Converte explicitamente para int para evitar TypeError no fromtimestamp
-            timestamp = int(raw_timestamp)
-            dt = datetime.fromtimestamp(timestamp)
-            records.append({
-                "date": dt,
-                "tvl": item.get("tvl")
-            })
-        except (TypeError, ValueError, OverflowError, OSError):
-            # Ignora registros com timestamp inválido ou fora de alcance
-            continue
-    return pd.DataFrame(records)
-
-
-def process_chain_tvl_chart(data):
-    """Processa dados do histórico de TVL por chain."""
-    records = []
-    for item in data:
-        try:
-            timestamp = int(item.get("date"))
-            dt = datetime.fromtimestamp(timestamp)
-            records.append({
-                "date": dt,
-                "tvl": item.get("tvl")
-            })
-        except (TypeError, ValueError, OverflowError, OSError):
-            continue
-    return pd.DataFrame(records)
-
-
-def main():
+def safe_fromtimestamp(ts, unit='s'):
+    """Converte timestamp numérico para datetime, evitando TypeError."""
+    if ts is None or pd.isna(ts):
+        return pd.NaT
     try:
-        protocols = get_protocols()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Erro ao buscar protocolos: {e}")
-        return
+        ts = int(float(ts))
+        if unit == 'ms':
+            ts = ts / 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return pd.NaT
 
-    # Sidebar: filtros
-    st.sidebar.header("Filtros")
 
-    chains = sorted({p.get("chain", "Desconhecida") for p in protocols})
-    selected_chain = st.sidebar.selectbox("Chain", ["Todas"] + chains)
+def get_defillama_protocols():
+    url = "https://api.defillama.com/protocols"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-    categories = sorted({p.get("category", "Desconhecida") for p in protocols})
-    selected_category = st.sidebar.selectbox("Categoria", ["Todas"] + categories)
 
-    min_tvl = st.sidebar.number_input("TVL mínima (USD)", min_value=0.0, value=0.0, step=1_000_000.0)
+def get_global_tvl():
+    url = "https://api.defillama.com/charts"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data)
+    df['date'] = df['date'].apply(lambda x: safe_fromtimestamp(x, 's'))
+    df = df.dropna(subset=['date'])
+    df = df.sort_values('date')
+    return df
 
-    # Filtragem
-    filtered_protocols = []
-    for p in protocols:
-        tvl = p.get("tvl", 0) or 0
-        chain_match = selected_chain == "Todas" or p.get("chain") == selected_chain
-        category_match = selected_category == "Todas" or p.get("category") == selected_category
-        tvl_match = tvl >= min_tvl
-        if chain_match and category_match and tvl_match:
-            filtered_protocols.append(p)
 
-    st.subheader(f"Protocolos filtrados: {len(filtered_protocols)}")
+def get_stablecoins():
+    url = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data.get('peggedAssets', []))
+    return df
 
-    if filtered_protocols:
-        df_protocols = pd.DataFrame([
-            {
-                "Nome": p.get("name"),
-                "Chain": p.get("chain"),
-                "Categoria": p.get("category"),
-                "TVL (USD)": p.get("tvl", 0),
-                "Mudança 1d (%)": p.get("change_1d", 0),
-                "Mudança 7d (%)": p.get("change_7d", 0)
-            }
-            for p in filtered_protocols
-        ])
-        st.dataframe(df_protocols, use_container_width=True)
-    else:
-        st.info("Nenhum protocolo encontrado com os filtros selecionados.")
 
-    # Gráfico global de TVL
-    st.subheader("Histórico Global de TVL")
+def get_protocol_fees_revenue(protocol_slug):
+    url = f"https://api.defillama.com/summary/fees/{protocol_slug}"
+    r = requests.get(url, timeout=30)
+    if r.status_code == 200:
+        return r.json()
+    return None
+
+
+def aggregate_sectors(protocols):
+    df = pd.DataFrame(protocols)
+    df['tvl'] = pd.to_numeric(df.get('tvl', 0), errors='coerce').fillna(0)
+    df['category'] = df.get('category', 'Outro').fillna('Outro')
+    sector = df.groupby('category', as_index=False)['tvl'].sum().sort_values('tvl', ascending=False)
+    return sector
+
+
+# ---------- UI ----------
+
+st.title("🏦 DeFi Dashboard")
+
+abas = st.tabs(["Visão Geral", "TVL", "Stablecoins", "Receitas", "Setores"])
+
+# ---------- Aba 1: Visão Geral ----------
+with abas[0]:
+    st.header("Visão Geral")
+    st.markdown("Painel resumido com os principais indicadores do mercado DeFi.")
+
     try:
-        global_tvl_data = get_global_tvl_chart()
-        df_global_tvl = process_global_tvl_chart(global_tvl_data)
+        protocols = get_defillama_protocols()
+        tvl_df = get_global_tvl()
+        stables_df = get_stablecoins()
 
-        if not df_global_tvl.empty:
-            df_global_tvl = df_global_tvl.sort_values("date").reset_index(drop=True)
-            st.line_chart(df_global_tvl.set_index("date")["tvl"])
-        else:
-            st.info("Nenhum dado histórico de TVL disponível.")
-    except requests.exceptions.RequestException as e:
-        st.error(f"Erro ao buscar histórico global de TVL: {e}")
+        total_tvl = tvl_df['totalLiquidityUSD'].iloc[-1] if not tvl_df.empty else 0
+        total_protocols = len(protocols)
+        total_stable = pd.to_numeric(stables_df.get('circulating', 0), errors='coerce').sum()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("TVL Total (USD)", f"${total_tvl:,.0f}")
+        c2.metric("Protocolos Rastreados", f"{total_protocols}")
+        c3.metric("Stablecoins em Circulação", f"${total_stable:,.0f}")
+
+        fig = px.line(
+            tvl_df,
+            x='date',
+            y='totalLiquidityUSD',
+            title="Evolução do TVL Global",
+            labels={'totalLiquidityUSD': 'TVL (USD)', 'date': 'Data'}
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
     except Exception as e:
-        st.error(f"Erro inesperado ao processar histórico global de TVL: {e}")
+        st.error(f"Erro ao carregar Visão Geral: {e}")
 
-    # Gráfico de TVL por chain
-    st.subheader("Histórico de TVL por Chain")
-    chain_slugs = sorted({p.get("chain", "").lower().replace(" ", "-") for p in protocols if p.get("chain")})
-    selected_chain_slug = st.selectbox("Selecione a chain", chain_slugs)
+# ---------- Aba 2: TVL ----------
+with abas[1]:
+    st.header("TVL")
+    st.markdown("Análise detalhada do Total Value Locked global e por protocolo.")
 
-    if selected_chain_slug:
+    try:
+        tvl_df = get_global_tvl()
+        protocols = get_defillama_protocols()
+
+        fig = px.area(
+            tvl_df,
+            x='date',
+            y='totalLiquidityUSD',
+            title="TVL Global ao Longo do Tempo",
+            labels={'totalLiquidityUSD': 'TVL (USD)', 'date': 'Data'}
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        top_df = pd.DataFrame(protocols)
+        top_df['tvl'] = pd.to_numeric(top_df.get('tvl', 0), errors='coerce').fillna(0)
+        top_df = top_df.sort_values('tvl', ascending=False).head(15)
+
+        fig2 = px.bar(
+            top_df,
+            x='tvl',
+            y='name',
+            orientation='h',
+            title="Top 15 Protocolos por TVL",
+            labels={'tvl': 'TVL (USD)', 'name': 'Protocolo'}
+        )
+        fig2.update_layout(yaxis={'categoryorder': 'total ascending'})
+        st.plotly_chart(fig2, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Erro ao carregar TVL: {e}")
+
+# ---------- Aba 3: Stablecoins ----------
+with abas[2]:
+    st.header("Stablecoins")
+    st.markdown("Dados de stablecoins por capitalização de mercado e dominância.")
+
+    try:
+        stables_df = get_stablecoins()
+        stables_df['circulating'] = pd.to_numeric(stables_df.get('circulating', 0), errors='coerce').fillna(0)
+        stables_df = stables_df.sort_values('circulating', ascending=False).head(15)
+
+        fig = px.pie(
+            stables_df,
+            names='name',
+            values='circulating',
+            title="Market Share das Stablecoins",
+            hole=0.4
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        fig2 = px.bar(
+            stables_df,
+            x='name',
+            y='circulating',
+            title="Capitalização das Top Stablecoins",
+            labels={'circulating': 'Circulante (USD)', 'name': 'Stablecoin'}
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Erro ao carregar Stablecoins: {e}")
+
+# ---------- Aba 4: Receitas (Fees vs Receita) ----------
+with abas[3]:
+    st.header("Receitas")
+    st.markdown("Comparativo entre Fees geradas e Receita capturada pelos protocolos.")
+
+    protocol_slug = st.text_input("Slug do protocolo no DeFiLlama (ex: uniswap, aave, lido)", value="uniswap")
+
+    if protocol_slug:
         try:
-            chain_tvl_data = get_chain_tvl_chart(selected_chain_slug)
-            df_chain_tvl = process_chain_tvl_chart(chain_tvl_data)
-
-            if not df_chain_tvl.empty:
-                df_chain_tvl = df_chain_tvl.sort_values("date").reset_index(drop=True)
-                st.line_chart(df_chain_tvl.set_index("date")["tvl"])
+            data = get_protocol_fees_revenue(protocol_slug)
+            if not data or 'totalDataChart' not in data:
+                st.warning("Dados de fees/receita não encontrados para este protocolo.")
             else:
-                st.info("Nenhum dado histórico de TVL para esta chain.")
-        except requests.exceptions.RequestException as e:
-            st.error(f"Erro ao buscar histórico de TVL da chain: {e}")
+                chart = data['totalDataChart']
+                df = pd.DataFrame(chart, columns=['date', 'fees', 'revenue'])
+                df['date'] = df['date'].apply(lambda x: safe_fromtimestamp(x, 's'))
+                df = df.dropna(subset=['date'])
+                df['fees'] = pd.to_numeric(df.get('fees', 0), errors='coerce').fillna(0)
+                df['revenue'] = pd.to_numeric(df.get('revenue', 0), errors='coerce').fillna(0)
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df['date'], y=df['fees'], mode='lines', name='Fees', stackgroup='one'))
+                fig.add_trace(go.Scatter(x=df['date'], y=df['revenue'], mode='lines', name='Receita', stackgroup='one'))
+                fig.update_layout(
+                    title=f"Fees vs Receita: {protocol_slug.title()}",
+                    xaxis_title="Data",
+                    yaxis_title="USD",
+                    hovermode="x unified"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                c1, c2 = st.columns(2)
+                c1.metric("Fees Totais", f"${df['fees'].sum():,.0f}")
+                c2.metric("Receita Total", f"${df['revenue'].sum():,.0f}")
+
         except Exception as e:
-            st.error(f"Erro inesperado ao processar histórico de TVL da chain: {e}")
+            st.error(f"Erro ao carregar Receitas: {e}")
 
+# ---------- Aba 5: Setores ----------
+with abas[4]:
+    st.header("Setores")
+    st.markdown("Distribuição do TVL por categoria/setor do mercado DeFi.")
 
-if __name__ == "__main__":
-    main()
+    try:
+        protocols = get_defillama_protocols()
+        sector_df = aggregate_sectors(protocols)
+
+        fig = px.treemap(
+            sector_df,
+            path=['category'],
+            values='tvl',
+            title="TVL por Setor",
+            color='tvl',
+            color_continuous_scale='Blues'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        fig2 = px.bar(
+            sector_df.head(15),
+            x='category',
+            y='tvl',
+            title="Top Setores por TVL",
+            labels={'tvl': 'TVL (USD)', 'category': 'Setor'}
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Erro ao carregar Setores: {e}")
